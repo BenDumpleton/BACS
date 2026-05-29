@@ -7,6 +7,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
@@ -37,7 +38,7 @@ async function callClaude(apiKey, messages, system, maxTokens = 4096) {
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-5",
+      model: "claude-sonnet-4-20250514",
       max_tokens: maxTokens,
       system,
       messages,
@@ -62,6 +63,169 @@ async function fileToBase64(file) {
     r.onerror = reject;
     r.readAsDataURL(file);
   });
+}
+
+// ── PDF chunking via PDF.js ───────────────────────────────────────────────────
+const CHUNK_SIZE = 90; // pages per API call — safely under the 100 page limit
+
+async function getPdfPageCount(file) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  return pdf.numPages;
+}
+
+async function splitPdfToChunks(file, chunkSize = CHUNK_SIZE) {
+  // Returns array of base64 strings, each representing a chunk of pages.
+  // Uses PDF.js to render each page to canvas, then re-encodes as a
+  // single-page-per-chunk PDF via a minimal PDF writer.
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const totalPages = pdfDoc.numPages;
+
+  // Build page ranges
+  const ranges = [];
+  for (let start = 1; start <= totalPages; start += chunkSize) {
+    ranges.push({ start, end: Math.min(start + chunkSize - 1, totalPages) });
+  }
+
+  // For each range, render pages to canvas and encode as PNG data URLs,
+  // then bundle into a minimal multi-image PDF using a pure-JS PDF builder.
+  const chunks = [];
+  for (const { start, end } of ranges) {
+    const pagesData = [];
+    for (let p = start; p <= end; p++) {
+      const page = await pdfDoc.getPage(p);
+      const viewport = page.getViewport({ scale: 1.5 });
+      const canvas = document.createElement("canvas");
+      canvas.width  = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      pagesData.push({
+        dataUrl: canvas.toDataURL("image/jpeg", 0.85),
+        width:   viewport.width,
+        height:  viewport.height,
+      });
+    }
+    // Build a minimal PDF containing these pages as JPEG images
+    const pdfBytes = buildImagePdf(pagesData);
+    // Convert to base64
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(pdfBytes)));
+    chunks.push(b64);
+  }
+  return { chunks, totalPages, numChunks: chunks.length };
+}
+
+// Minimal pure-JS PDF builder — embeds JPEG images one per page
+function buildImagePdf(pages) {
+  const enc = s => new TextEncoder().encode(s);
+  const parts = [];
+  let offset = 0;
+  const offsets = [];
+
+  const push = s => { parts.push(enc(s)); offset += enc(s).length; };
+  const pushRaw = bytes => { parts.push(bytes); offset += bytes.length; };
+
+  push("%PDF-1.4\n");
+
+  const imgObjs = [];
+  const pageObjs = [];
+  let objNum = 1;
+
+  // We'll collect all objects first, then write them
+  const objects = [];
+
+  // Catalog = obj 1, Pages = obj 2
+  const catalogId = objNum++;
+  const pagesId   = objNum++;
+
+  for (let i = 0; i < pages.length; i++) {
+    const imgId      = objNum++;
+    const contentId  = objNum++;
+    const pageId     = objNum++;
+    imgObjs.push({ imgId, contentId, pageId, page: pages[i] });
+    pageObjs.push(pageId);
+  }
+
+  // Build object strings
+  const allObjs = [];
+
+  // Catalog
+  allObjs.push({ id: catalogId, str: `${catalogId} 0 obj\n<< /Type /Catalog /Pages ${pagesId} 0 R >>\nendobj\n` });
+  // Pages
+  allObjs.push({ id: pagesId, str: `${pagesId} 0 obj\n<< /Type /Pages /Kids [${pageObjs.map(p=>`${p} 0 R`).join(" ")}] /Count ${pages.length} >>\nendobj\n` });
+
+  for (const { imgId, contentId, pageId, page } of imgObjs) {
+    // Strip data URL header to get raw JPEG bytes
+    const b64data = page.dataUrl.split(",")[1];
+    const raw = Uint8Array.from(atob(b64data), c => c.charCodeAt(0));
+    const w = Math.round(page.width);
+    const h = Math.round(page.height);
+    const stream = `q ${w} 0 0 ${h} 0 0 cm /Im${imgId} Do Q`;
+
+    allObjs.push({ id: imgId, isImage: true, raw, w, h });
+    allObjs.push({ id: contentId, stream });
+    allObjs.push({ id: pageId, str:
+      `${pageId} 0 obj\n<< /Type /Page /Parent ${pagesId} 0 R ` +
+      `/MediaBox [0 0 ${w} ${h}] ` +
+      `/Contents ${contentId} 0 R ` +
+      `/Resources << /XObject << /Im${imgId} ${imgId} 0 R >> >> >>\nendobj\n`
+    });
+  }
+
+  // Now write everything and track xref offsets
+  const header = enc("%PDF-1.4\n");
+  const allParts = [header];
+  let pos = header.length;
+  const xref = {};
+
+  for (const obj of allObjs) {
+    xref[obj.id] = pos;
+    if (obj.isImage) {
+      const hdr = enc(
+        `${obj.id} 0 obj\n<< /Type /XObject /Subtype /Image ` +
+        `/Width ${obj.w} /Height ${obj.h} /ColorSpace /DeviceRGB ` +
+        `/BitsPerComponent 8 /Filter /DCTDecode /Length ${obj.raw.length} >>\nstream\n`
+      );
+      const footer = enc("\nendstream\nendobj\n");
+      allParts.push(hdr, obj.raw, footer);
+      pos += hdr.length + obj.raw.length + footer.length;
+    } else if (obj.stream !== undefined) {
+      const streamBytes = enc(obj.stream);
+      const hdr = enc(`${obj.id} 0 obj\n<< /Length ${streamBytes.length} >>\nstream\n`);
+      const footer = enc("\nendstream\nendobj\n");
+      allParts.push(hdr, streamBytes, footer);
+      pos += hdr.length + streamBytes.length + footer.length;
+    } else {
+      const bytes = enc(obj.str);
+      allParts.push(bytes);
+      pos += bytes.length;
+    }
+  }
+
+  // xref table
+  const xrefPos = pos;
+  const ids = Object.keys(xref).map(Number).sort((a,b)=>a-b);
+  let xrefStr = `xref\n0 ${ids[ids.length-1]+1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= ids[ids.length-1]; i++) {
+    xrefStr += xref[i] != null
+      ? `${String(xref[i]).padStart(10,"0")} 00000 n \n`
+      : `0000000000 65535 f \n`;
+  }
+  xrefStr += `trailer\n<< /Size ${ids[ids.length-1]+1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
+  allParts.push(enc(xrefStr));
+
+  // Flatten
+  const total = allParts.reduce((s,p) => s + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of allParts) { out.set(p, off); off += p.length; }
+  return out;
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -421,17 +585,54 @@ function App() {
       setProgress(35);
 
       addLog("Reading invoices PDF…");
-      setProgLabel("Extracting invoice data");
-      const invB64 = await fileToBase64(invoiceFile);
-      const invText = await callClaude(apiKey, [{
-        role:"user",
-        content:[
-          { type:"document", source:{ type:"base64", media_type:"application/pdf", data:invB64 } },
-          { type:"text", text:"Extract all invoices from this document. There may be multiple invoices." },
-        ],
-      }], SYS_INVOICES);
-      const invData = parseJSON(invText);
-      addLog(`✓ Invoices: ${invData.invoices?.length ?? 0} invoices/credit notes extracted`, "ok");
+      setProgLabel("Checking invoice PDF size");
+      const pageCount = await getPdfPageCount(invoiceFile);
+      addLog(`Invoice PDF: ${pageCount} pages detected`);
+
+      let allInvoices = [];
+
+      if (pageCount <= CHUNK_SIZE) {
+        // Single pass — fits within API limit
+        setProgLabel("Extracting invoice data");
+        const invB64 = await fileToBase64(invoiceFile);
+        const invText = await callClaude(apiKey, [{
+          role:"user",
+          content:[
+            { type:"document", source:{ type:"base64", media_type:"application/pdf", data:invB64 } },
+            { type:"text", text:"Extract all invoices from this document. There may be multiple invoices." },
+          ],
+        }], SYS_INVOICES);
+        const invData = parseJSON(invText);
+        allInvoices = invData.invoices || [];
+        addLog(`✓ Invoices: ${allInvoices.length} invoices/credit notes extracted`, "ok");
+      } else {
+        // Multi-chunk pass
+        addLog(`PDF exceeds ${CHUNK_SIZE} pages — splitting into chunks…`, "warn");
+        setProgLabel("Splitting invoice PDF into chunks");
+        const { chunks, numChunks } = await splitPdfToChunks(invoiceFile);
+        addLog(`Split into ${numChunks} chunk${numChunks > 1 ? "s" : ""} of up to ${CHUNK_SIZE} pages each`);
+
+        for (let c = 0; c < chunks.length; c++) {
+          setProgLabel(`Extracting invoices — chunk ${c + 1} of ${numChunks}`);
+          addLog(`Processing chunk ${c + 1}/${numChunks}…`);
+          const invText = await callClaude(apiKey, [{
+            role:"user",
+            content:[
+              { type:"document", source:{ type:"base64", media_type:"application/pdf", data:chunks[c] } },
+              { type:"text", text:"Extract all invoices from this document. There may be multiple invoices." },
+            ],
+          }], SYS_INVOICES);
+          const invData = parseJSON(invText);
+          const found = invData.invoices || [];
+          allInvoices = allInvoices.concat(found);
+          addLog(`✓ Chunk ${c + 1}: ${found.length} invoices found`, "ok");
+          // Update progress proportionally through the 35–65 range
+          setProgress(35 + Math.round(((c + 1) / numChunks) * 30));
+        }
+        addLog(`✓ Total invoices extracted: ${allInvoices.length}`, "ok");
+      }
+
+      const invData = { invoices: allInvoices };
       setProgress(65);
 
       addLog("Reconciling…");
